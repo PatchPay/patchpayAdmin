@@ -14,18 +14,19 @@ export interface Promo {
   discountValue: number; // % or amount, unused for fee_waiver
   minTransaction: number; // minimum transaction amount to qualify
   usageLimit: number; // total redemptions allowed, 0 = unlimited
-  perUserLimit: number; // redemptions per user
+  perUserLimit: number; // redemptions per user, 0 = unlimited
   startDate: string; // yyyy-mm-dd
   endDate: string; // yyyy-mm-dd
   paused: boolean;
+  stoppedAt?: string | null; // yyyy-mm-dd. Set when stopped; stopped promos are archived, never deleted
   redeemed: number;
 }
 
 interface PromotionProps {
   initialPromos?: Promo[];
   onCreate?: (promo: Promo) => void | Promise<void>;
+  /** Called for pause/resume, stop and restore. A stopped promo arrives with `stoppedAt` set. */
   onUpdate?: (promo: Promo) => void | Promise<void>;
-  onDelete?: (id: string) => void | Promise<void>;
 }
 
 /* ---------------------------- Constants -------------------------- */
@@ -49,6 +50,12 @@ const today = () => new Date().toISOString().slice(0, 10);
 const inDays = (n: number) =>
   new Date(Date.now() + n * 86_400_000).toISOString().slice(0, 10);
 
+/** yyyy-mm-dd -> dd/mm/yyyy (string split, so no timezone shifts) */
+const formatDate = (iso: string): string => {
+  const [y, m, d] = iso.split("-");
+  return y && m && d ? `${d}/${m}/${y}` : "—";
+};
+
 const generateCode = (personas: Persona[]): string => {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no confusing 0/O/1/I
   const rand = Array.from({ length: 5 }, () =>
@@ -64,9 +71,17 @@ const describeDiscount = (type: DiscountType, value: number): string => {
   return "No transaction fee";
 };
 
-type Status = "Active" | "Scheduled" | "Expired" | "Paused" | "Used up";
+/** One line only: the per-user cap if set, else the total cap, else "Unlimited". */
+const describeLimit = (usageLimit: number, perUserLimit: number): string => {
+  if (perUserLimit > 0) return `${perUserLimit} per user`;
+  if (usageLimit > 0) return `${usageLimit} uses in total`;
+  return "Unlimited";
+};
+
+type Status = "Active" | "Scheduled" | "Expired" | "Paused" | "Used up" | "Stopped";
 
 const getStatus = (p: Promo): Status => {
+  if (p.stoppedAt) return "Stopped";
   if (p.paused) return "Paused";
   if (p.usageLimit > 0 && p.redeemed >= p.usageLimit) return "Used up";
   const t = today();
@@ -81,6 +96,7 @@ const STATUS_STYLE: Record<Status, string> = {
   Paused: "bg-amber-50 text-amber-700 ring-amber-200",
   Expired: "bg-slate-100 text-slate-600 ring-slate-200",
   "Used up": "bg-slate-100 text-slate-600 ring-slate-200",
+  Stopped: "bg-rose-50 text-rose-700 ring-rose-200",
 };
 
 /* --------------------------- Seed data --------------------------- */
@@ -115,6 +131,22 @@ const SEED: Promo[] = [
     endDate: inDays(35),
     paused: false,
     redeemed: 0,
+  },
+  {
+    id: "3",
+    code: "PATCH-PER-R8WD4",
+    name: "Personal launch offer",
+    personas: ["Personal"],
+    discountType: "fixed",
+    discountValue: 5,
+    minTransaction: 50,
+    usageLimit: 500,
+    perUserLimit: 1,
+    startDate: inDays(-30),
+    endDate: inDays(30),
+    paused: false,
+    stoppedAt: inDays(-3),
+    redeemed: 18,
   },
 ];
 
@@ -169,16 +201,12 @@ const Field = ({
 
 /* ---------------------------- Component -------------------------- */
 
-const Promotion = ({
-  initialPromos = SEED,
-  onCreate,
-  onUpdate,
-  onDelete,
-}: PromotionProps) => {
+const Promotion = ({ initialPromos = SEED, onCreate, onUpdate }: PromotionProps) => {
   const [promos, setPromos] = useState<Promo[]>(initialPromos);
   const [form, setForm] = useState<FormState>(emptyForm);
   const [copied, setCopied] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [view, setView] = useState<"all" | "stopped">("all");
 
   const set = <K extends keyof FormState>(key: K, value: FormState[K]) =>
     setForm((f) => ({ ...f, [key]: value }));
@@ -191,13 +219,22 @@ const Promotion = ({
         : [...form.personas, p]
     );
 
+  const currentPromos = useMemo(() => promos.filter((p) => !p.stoppedAt), [promos]);
+  const stoppedPromos = useMemo(() => promos.filter((p) => p.stoppedAt), [promos]);
+  const visible = view === "all" ? currentPromos : stoppedPromos;
+
   const errors = useMemo(() => {
     const e: string[] = [];
     if (!form.name.trim()) e.push("Give the promotion a name.");
     if (form.personas.length === 0) e.push("Pick at least one customer type.");
     if (!form.code.trim()) e.push("Generate or enter a promo code.");
-    if (promos.some((p) => p.code === form.code.trim().toUpperCase()))
-      e.push("That code is already in use.");
+    const clash = promos.find((p) => p.code === form.code.trim().toUpperCase());
+    if (clash)
+      e.push(
+        clash.stoppedAt
+          ? "That code belongs to a stopped promotion."
+          : "That code is already in use."
+      );
     if (form.discountType === "percent" && (form.discountValue <= 0 || form.discountValue > 100))
       e.push("Percentage must be between 1 and 100.");
     if (form.discountType === "fixed" && form.discountValue <= 0)
@@ -215,6 +252,7 @@ const Promotion = ({
       name: form.name.trim(),
       code: form.code.trim().toUpperCase(),
       paused: false,
+      stoppedAt: null,
       redeemed: 0,
     };
     try {
@@ -226,15 +264,27 @@ const Promotion = ({
     }
   };
 
+  const replace = (next: Promo) =>
+    setPromos((prev) => prev.map((p) => (p.id === next.id ? next : p)));
+
   const togglePause = async (promo: Promo) => {
     const next = { ...promo, paused: !promo.paused };
     await onUpdate?.(next);
-    setPromos((prev) => prev.map((p) => (p.id === promo.id ? next : p)));
+    replace(next);
   };
 
-  const remove = async (id: string) => {
-    await onDelete?.(id);
-    setPromos((prev) => prev.filter((p) => p.id !== id));
+  /** Stop = archive. The promo can no longer be redeemed but stays on record. */
+  const stop = async (promo: Promo) => {
+    const next: Promo = { ...promo, stoppedAt: today() };
+    await onUpdate?.(next);
+    replace(next);
+  };
+
+  /** Restore brings a stopped promo back as Paused, so an admin resumes it on purpose. */
+  const restore = async (promo: Promo) => {
+    const next: Promo = { ...promo, stoppedAt: null, paused: true };
+    await onUpdate?.(next);
+    replace(next);
   };
 
   const copy = async (code: string) => {
@@ -246,6 +296,11 @@ const Promotion = ({
       /* clipboard unavailable */
     }
   };
+
+  const tabs = [
+    { key: "all" as const, label: "All promotions", count: currentPromos.length },
+    { key: "stopped" as const, label: "Stopped", count: stoppedPromos.length },
+  ];
 
   return (
     <div className="mx-auto w-full max-w-6xl space-y-6">
@@ -369,13 +424,13 @@ const Promotion = ({
                   onChange={(e) => set("usageLimit", parseInt(e.target.value) || 0)}
                 />
               </Field>
-              <Field label="Uses per user">
+              <Field label="Uses per user" hint="0 means unlimited.">
                 <input
                   type="number"
-                  min={1}
+                  min={0}
                   className={inputCls}
                   value={form.perUserLimit}
-                  onChange={(e) => set("perUserLimit", parseInt(e.target.value) || 1)}
+                  onChange={(e) => set("perUserLimit", parseInt(e.target.value) || 0)}
                 />
               </Field>
             </div>
@@ -446,20 +501,19 @@ const Promotion = ({
             <div className="flex justify-between gap-4">
               <dt className="text-slate-500">For</dt>
               <dd className="text-right text-slate-900">
-                {form.personas.length ? form.personas.join(", ") : "No one yet"}
+                {form.personas.length ? form.personas.join(", ") : "None"}
               </dd>
             </div>
             <div className="flex justify-between gap-4">
               <dt className="text-slate-500">Valid</dt>
               <dd className="text-slate-900">
-                {form.startDate} to {form.endDate}
+                {formatDate(form.startDate)} to {formatDate(form.endDate)}
               </dd>
             </div>
             <div className="flex justify-between gap-4">
               <dt className="text-slate-500">Limit</dt>
               <dd className="text-slate-900">
-                {form.usageLimit > 0 ? `${form.usageLimit} uses` : "Unlimited"},{" "}
-                {form.perUserLimit} per user
+                {describeLimit(form.usageLimit, form.perUserLimit)}
               </dd>
             </div>
           </dl>
@@ -468,15 +522,40 @@ const Promotion = ({
 
       {/* --------------------------- Promo list -------------------------- */}
       <section className="rounded-xl border border-slate-200 bg-white shadow-sm">
-        <header className="border-b border-slate-200 px-6 py-4">
-          <h3 className="font-semibold text-slate-900">
-            All promotions <span className="font-normal text-slate-500">({promos.length})</span>
-          </h3>
+        <header className="flex flex-wrap gap-1 border-b border-slate-200 px-4 py-3 sm:px-6">
+          {tabs.map(({ key, label, count }) => {
+            const active = view === key;
+            return (
+              <button
+                key={key}
+                type="button"
+                aria-pressed={active}
+                onClick={() => setView(key)}
+                className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                  active
+                    ? "bg-indigo-50 text-indigo-700"
+                    : "text-slate-600 hover:bg-slate-100"
+                }`}
+              >
+                {label}{" "}
+                <span className={active ? "text-indigo-400" : "text-slate-400"}>({count})</span>
+              </button>
+            );
+          })}
         </header>
 
-        {promos.length === 0 ? (
+        {view === "stopped" && (
+          <p className="border-b border-slate-100 bg-slate-50 px-6 py-2.5 text-xs text-slate-500">
+            Stopped promotions can no longer be redeemed. They are kept on record and
+            can be restored; a restored promotion comes back paused.
+          </p>
+        )}
+
+        {visible.length === 0 ? (
           <p className="px-6 py-10 text-center text-sm text-slate-500">
-            No promotions yet. Create one above to get started.
+            {view === "all"
+              ? "No promotions yet. Create one above to get started."
+              : "No stopped promotions. Anything you stop will be kept here."}
           </p>
         ) : (
           <div className="overflow-x-auto">
@@ -488,19 +567,19 @@ const Promotion = ({
                   <th className="px-3 py-3">Customer type</th>
                   <th className="px-3 py-3">Discount</th>
                   <th className="px-3 py-3">Used</th>
-                  <th className="px-3 py-3">Status</th>
+                  <th className="px-3 py-3">{view === "all" ? "Status" : "Stopped on"}</th>
                   <th className="px-6 py-3 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {promos.map((p) => {
+                {visible.map((p) => {
                   const status = getStatus(p);
                   return (
                     <tr key={p.id} className="hover:bg-slate-50/60">
                       <td className="px-6 py-3">
                         <p className="font-medium text-slate-900">{p.name}</p>
                         <p className="text-xs text-slate-500">
-                          {p.startDate} to {p.endDate}
+                          {formatDate(p.startDate)} to {formatDate(p.endDate)}
                         </p>
                       </td>
                       <td className="px-3 py-3">
@@ -522,28 +601,46 @@ const Promotion = ({
                         {p.usageLimit > 0 ? ` / ${p.usageLimit}` : ""}
                       </td>
                       <td className="px-3 py-3">
-                        <span
-                          className={`inline-flex rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset ${STATUS_STYLE[status]}`}
-                        >
-                          {status}
-                        </span>
+                        {view === "all" ? (
+                          <span
+                            className={`inline-flex rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset ${STATUS_STYLE[status]}`}
+                          >
+                            {status}
+                          </span>
+                        ) : (
+                          <span className="text-slate-700">
+                            {p.stoppedAt ? formatDate(p.stoppedAt) : "—"}
+                          </span>
+                        )}
                       </td>
                       <td className="px-6 py-3 text-right">
                         <div className="flex justify-end gap-3">
-                          <button
-                            type="button"
-                            onClick={() => togglePause(p)}
-                            className="text-sm font-medium text-indigo-600 hover:text-indigo-800"
-                          >
-                            {p.paused ? "Resume" : "Pause"}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => remove(p.id)}
-                            className="text-sm font-medium text-red-600 hover:text-red-800"
-                          >
-                            Delete
-                          </button>
+                          {view === "all" ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => togglePause(p)}
+                                className="text-sm font-medium text-indigo-600 hover:text-indigo-800"
+                              >
+                                {p.paused ? "Resume" : "Pause"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => stop(p)}
+                                className="text-sm font-medium text-red-600 hover:text-red-800"
+                              >
+                                Stop
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => restore(p)}
+                              className="text-sm font-medium text-indigo-600 hover:text-indigo-800"
+                            >
+                              Restore
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>
