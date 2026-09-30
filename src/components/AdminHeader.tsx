@@ -3,7 +3,7 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 
 import { useEffect, useRef, useState } from "react";
-import axios from "axios";
+import axios from "../config/axiosconfig";
 import {
   Bell,
   ChevronDown,

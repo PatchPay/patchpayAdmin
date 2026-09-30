@@ -2,7 +2,7 @@
 /* eslint-disable react-hooks/exhaustive-deps */
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useEffect, useState } from "react";
-import axios from "axios";
+import axios from "../config/axiosconfig";
 import {
   BarChart3,
   Bell,
